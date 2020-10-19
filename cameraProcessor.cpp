@@ -4,9 +4,17 @@
 #include <fstream>
 #include <chrono>
 #include <vector>
+#include <cstdlib>
 
 #include <opencv2/core/types.hpp>
 #include <opencv2/opencv.hpp>
+
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#include <cassert>
 
 #ifdef FAST_CHECK
 #define FIND_CB_FLAGS (CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE | CALIB_CB_FAST_CHECK)
@@ -23,6 +31,12 @@ static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points
 static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, float square_size);
 static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* path);
 
+static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const char* path);
+
+static int open_stream(const char* path, int width, int height, int frame_bytes);
+
+static void print_mat_to_stream(int stream, Mat& img, int frame_bytes);
+
 void camera_processor::calibrate_camera(int camera_index, 
                                         int pattern_width, int pattern_height, 
                                         float square_size, 
@@ -32,7 +46,7 @@ void camera_processor::calibrate_camera(int camera_index,
   vector<vector<Vec2f>> img_points; 
 
   Mat camera_matrix = Mat::eye(3, 3, CV_64F);
-  Mat dist_coeffs   = Mat::zeros(5, 1, CV_64F);
+  Mat dist_coeffs   = Mat::zeros(8, 1, CV_64F);
 
   Size pattern_size = Size(pattern_width, pattern_height); 
   Size frame_size   = calib_fetch_data(camera_index, img_points, pattern_size);
@@ -48,11 +62,46 @@ void camera_processor::calibrate_camera(int camera_index,
   calib_save_params(camera_matrix, dist_coeffs, output_path);
 }
 
-
-
 void camera_processor::undistort_camera(int camera_index, const char* camera_params_path, 
                                         const char* output_stream) {
-  // TODO  
+  VideoCapture cap;
+    
+  if(!cap.open(camera_index)) {
+    cerr << "Could not open camera with id " << camera_index << '!' << endl; 
+    exit(EXIT_FAILURE);
+  }
+
+  Mat camera_matrix = Mat::eye(3, 3, CV_64F);
+  Mat dist_coeffs   = Mat::zeros(8, 1, CV_64F);
+  undistort_load_params(camera_matrix, dist_coeffs, camera_params_path);
+
+  int width = cap.get(CAP_PROP_FRAME_WIDTH);
+  int height = cap.get(CAP_PROP_FRAME_HEIGHT);
+  int frame_bytes = 3 * width * height / 2;
+
+  int stream = open_stream(output_stream, width, height, frame_bytes);
+  
+  cout << "Press 'q' to close the virtual camera!" << endl;
+  Mat frame, gray;
+  unsigned char* frame_b = new unsigned char[frame_bytes];
+  while(true) {
+    cap >> frame;
+    if( frame.empty() ) {
+      cerr << "Error loading frame! " << endl; 
+      exit(EXIT_FAILURE);
+    }
+    Mat undistorted_frame = frame.clone();
+    undistort(frame, undistorted_frame, camera_matrix, dist_coeffs);
+    print_mat_to_stream(stream, undistorted_frame, frame_bytes);
+    
+    imshow("merge", undistorted_frame); 
+    undistorted_frame.release();
+    if( waitKey(10) == 'q' ) {
+      break; 
+    }
+  }
+  delete[] frame_b; 
+  close(stream);
 }
 
 static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points, Size pattern_size) {
@@ -113,10 +162,71 @@ static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, flo
   }
 }
 
+static void print_mat(ostream& out, Mat& m) {
+  for(int i = 0; i < m.rows; i++) {
+    for(int j = 0; j < m.cols; j++) {
+      out << m.at<double>(i,j) << ' ';
+    }
+    out << '\n';
+  } 
+}
+
+static void read_mat(istream& in, Mat& m) {
+  for(int i = 0; i < m.rows; i++) {
+    for(int j = 0; j < m.cols; j++) {
+      in >> m.at<double>(i,j);
+    }
+  } 
+}
+
 static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* path) {
   ofstream out(path);
-
-  out << camera_matrix << dist_coeffs;
-
+  
+  print_mat(out, camera_matrix);
+  print_mat(out, dist_coeffs);
+  
   out.close();
+}
+
+static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const char* path) { 
+  ifstream in(path);
+
+  read_mat(in, camera_matrix);
+  read_mat(in, dist_coeffs);
+
+  in.close();
+}
+
+static int open_stream(const char* path, int width, int height, int frame_bytes) { 
+  int stream = open(path, O_RDWR);
+  if(stream == -1) {
+    cerr << "Could not open output stream!" << endl;
+    exit(EXIT_FAILURE);
+  }
+  
+  struct v4l2_format v;
+  
+  v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  if (ioctl(stream, VIDIOC_G_FMT, &v) == -1){
+    cerr << "Could not setup video device" << endl;
+    exit(EXIT_FAILURE);
+  }
+  v.fmt.pix.width = width;
+  v.fmt.pix.height = height;
+  v.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+  v.fmt.pix.sizeimage = frame_bytes;
+  v.fmt.pix.field = V4L2_FIELD_NONE;
+  
+  if (ioctl(stream, VIDIOC_S_FMT, &v) == -1){
+    cerr << "Could not setup video device" << endl;
+    exit(EXIT_FAILURE);
+  }
+  return stream;
+}
+
+
+static void print_mat_to_stream(int stream, Mat& img, int frame_bytes) {
+  Mat yuv;
+  cvtColor(img, yuv, COLOR_BGR2YUV_I420);
+  write(stream, yuv.ptr(), frame_bytes);
 }
