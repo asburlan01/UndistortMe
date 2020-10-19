@@ -32,15 +32,15 @@ static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, flo
 static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* path);
 
 static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const char* path);
-
 static int open_stream(const char* path, int width, int height, int frame_bytes);
-
 static void print_mat_to_stream(int stream, Mat& img, int frame_bytes);
 
 void camera_processor::calibrate_camera(int camera_index, 
                                         int pattern_width, int pattern_height, 
                                         float square_size, 
                                         const char* output_path) {
+
+  assert(output_path);
 
   vector<vector<Vec3f>> obj_points(1);
   vector<vector<Vec2f>> img_points; 
@@ -50,6 +50,10 @@ void camera_processor::calibrate_camera(int camera_index,
 
   Size pattern_size = Size(pattern_width, pattern_height); 
   Size frame_size   = calib_fetch_data(camera_index, img_points, pattern_size);
+  if(img_points.empty()) {
+    cerr << "No calibration images were taken! Quitting..." << endl;
+    exit(EXIT_FAILURE);
+  }
 
   calib_compute_corners(obj_points[0], pattern_size, square_size);
   obj_points.resize(img_points.size(), obj_points[0]);
@@ -83,24 +87,23 @@ void camera_processor::undistort_camera(int camera_index, const char* camera_par
   
   cout << "Press 'q' to close the virtual camera!" << endl;
   Mat frame, gray;
-  unsigned char* frame_b = new unsigned char[frame_bytes];
   while(true) {
     cap >> frame;
     if( frame.empty() ) {
       cerr << "Error loading frame! " << endl; 
+      close(stream);
       exit(EXIT_FAILURE);
     }
     Mat undistorted_frame = frame.clone();
     undistort(frame, undistorted_frame, camera_matrix, dist_coeffs);
     print_mat_to_stream(stream, undistorted_frame, frame_bytes);
     
-    imshow("merge", undistorted_frame); 
+    imshow("Undistorted Preview", undistorted_frame); 
     undistorted_frame.release();
     if( waitKey(10) == 'q' ) {
       break; 
     }
   }
-  delete[] frame_b; 
   close(stream);
 }
 
@@ -142,7 +145,7 @@ static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points
       }
     }
     
-    imshow("Calibrate camera", frame); 
+    imshow("Calibrate Camera", frame); 
     if( waitKey(10) == 'q' ) {
       break; 
     }
@@ -205,10 +208,12 @@ static int open_stream(const char* path, int width, int height, int frame_bytes)
   }
   
   struct v4l2_format v;
+  memset(&v, 0, sizeof(v));
   
   v.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
   if (ioctl(stream, VIDIOC_G_FMT, &v) == -1){
     cerr << "Could not setup video device" << endl;
+    close(stream);
     exit(EXIT_FAILURE);
   }
   v.fmt.pix.width = width;
@@ -219,11 +224,11 @@ static int open_stream(const char* path, int width, int height, int frame_bytes)
   
   if (ioctl(stream, VIDIOC_S_FMT, &v) == -1){
     cerr << "Could not setup video device" << endl;
+    close(stream);
     exit(EXIT_FAILURE);
   }
   return stream;
 }
-
 
 static void print_mat_to_stream(int stream, Mat& img, int frame_bytes) {
   Mat yuv;
