@@ -27,35 +27,35 @@
 using namespace std;
 using namespace cv;
 
-static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points, Size pattern_size);
-static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, float square_size);
-static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* path);
+static Size calib_fetch_data(const int camera_index, const Size pattern_size, vector<vector<Vec2f>>& img_points);
+static void calib_compute_corners(const Size pattern_size, const float square_size, vector<Vec3f>& corners);
+static void calib_save_params(const Mat& camera_matrix, const Mat& dist_coeffs, const char* path);
 
 static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const char* path);
-static int open_stream(const char* path, int width, int height, int frame_bytes);
-static void print_mat_to_stream(int stream, Mat& img, int frame_bytes);
+static int v4l2_open_stream(const char* path, const int width, const int height, const int frame_bytes); 
+static void print_mat_to_stream(const int device, const Mat& img, const int frame_bytes);
 
-void camera_processor::calibrate_camera(int camera_index, 
-                                        int pattern_width, int pattern_height, 
-                                        float square_size, 
+void camera_processor::calibrate_camera(const unsigned int camera_index, 
+                                        const unsigned int pattern_width, const unsigned int pattern_height, 
+                                        const float square_size, 
                                         const char* output_path) {
 
   assert(output_path);
 
-  vector<vector<Vec3f>> obj_points(1);
-  vector<vector<Vec2f>> img_points; 
+  vector<vector<Vec3f>> obj_points(1); // calib point coords in the chessboard plane reference frame
+  vector<vector<Vec2f>> img_points;    // calib point coords in the image plane
 
   Mat camera_matrix = Mat::eye(3, 3, CV_64F);
   Mat dist_coeffs   = Mat::zeros(8, 1, CV_64F);
 
-  Size pattern_size = Size(pattern_width, pattern_height); 
-  Size frame_size   = calib_fetch_data(camera_index, img_points, pattern_size);
+  Size pattern_size = Size(pattern_width, pattern_height);                      // size of the calibration pattern
+  Size frame_size   = calib_fetch_data(camera_index, pattern_size, img_points); // size of one frame
   if(img_points.empty()) {
     cerr << "No calibration images were taken! Quitting..." << endl;
     exit(EXIT_FAILURE);
   }
 
-  calib_compute_corners(obj_points[0], pattern_size, square_size);
+  calib_compute_corners(pattern_size, square_size, obj_points[0]);
   obj_points.resize(img_points.size(), obj_points[0]);
   vector<Mat> rvecs, tvecs;
   double rms = calibrateCamera(obj_points, img_points, frame_size, camera_matrix,
@@ -66,7 +66,8 @@ void camera_processor::calibrate_camera(int camera_index,
   calib_save_params(camera_matrix, dist_coeffs, output_path);
 }
 
-void camera_processor::undistort_camera(int camera_index, const char* camera_params_path, 
+void camera_processor::undistort_camera(const unsigned int camera_index, 
+                                        const char* camera_params_path, 
                                         const char* output_stream) {
   VideoCapture cap;
     
@@ -79,11 +80,11 @@ void camera_processor::undistort_camera(int camera_index, const char* camera_par
   Mat dist_coeffs   = Mat::zeros(8, 1, CV_64F);
   undistort_load_params(camera_matrix, dist_coeffs, camera_params_path);
 
-  int width = cap.get(CAP_PROP_FRAME_WIDTH);
-  int height = cap.get(CAP_PROP_FRAME_HEIGHT);
-  int frame_bytes = 3 * width * height / 2;
+  int width  = cap.get(CAP_PROP_FRAME_WIDTH);  // frame width
+  int height = cap.get(CAP_PROP_FRAME_HEIGHT); // frame height
+  int frame_bytes = 3 * width * height / 2;    // number of bytes in a YUV420 frame
 
-  int stream = open_stream(output_stream, width, height, frame_bytes);
+  int stream = v4l2_open_stream(output_stream, width, height, frame_bytes); // output stream
   
   cout << "Press 'q' to close the virtual camera!" << endl;
   Mat frame, gray;
@@ -107,7 +108,14 @@ void camera_processor::undistort_camera(int camera_index, const char* camera_par
   close(stream);
 }
 
-static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points, Size pattern_size) {
+/* Fetch data required for camera calibration
+ * camera_index = index of camera to calibrate
+ * pattern_size = size of the chessboard calibration pattern
+ * img_points   = reference to the vector where results should be placed
+ *
+ * returns the size of a frame used for calibration
+ */
+static Size calib_fetch_data(const int camera_index, const Size pattern_size, vector<vector<Vec2f>>& img_points) {
   VideoCapture cap;
     
   if(!cap.open(camera_index)) {
@@ -129,16 +137,18 @@ static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points
     cvtColor(frame, gray, COLOR_BGR2GRAY);
     vector<Vec2f> corners;
     
-    if(findChessboardCorners(gray, pattern_size, corners, FIND_CB_FLAGS)) {
+    if(findChessboardCorners(gray, pattern_size, corners, FIND_CB_FLAGS)) {  // if the pattern was found
+      // Refine the point coordonates. Using parameters recommended on the opencv website
       cornerSubPix(gray, corners, Size(11, 11), Size(-1, -1),
                  TermCriteria(TermCriteria::Type::EPS + TermCriteria::Type::COUNT, 30,1e-3));   
-          
+      
+      // Draw results to the screen
       drawChessboardCorners(frame, pattern_size, corners, true);
           
       auto currentTime = chrono::system_clock::now();
       double deltaTime = chrono::duration<double>(currentTime - lastTime).count();
  
-      if(deltaTime > DELTA_TIME) {
+      if(deltaTime > DELTA_TIME) {  // Fetch data only if at least DELTA_TIME seconds have passed
         img_points.push_back(corners);
         lastTime = currentTime;
         cout << "Image captured! " << img_points.size() << " total images!\n";
@@ -154,8 +164,13 @@ static Size calib_fetch_data(int camera_index, vector<vector<Vec2f>>& img_points
   return frame.size();
 }
 
-
-static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, float square_size) {
+/* Compute the coordonates of the calibration pattern points in the coordonate frame of the chessboard
+ * where all points lie in the XY plane.
+ * pattern_size = size of the calibration pattern
+ * square_size  = length of the side of one square
+ * corners      = output array of the generated coordonates
+ */
+static void calib_compute_corners(const Size pattern_size, const float square_size, vector<Vec3f>& corners) {
   corners.clear();
 
   for(int i = 0; i < pattern_size.height; i++) {
@@ -165,7 +180,8 @@ static void calib_compute_corners(vector<Vec3f>& corners, Size pattern_size, flo
   }
 }
 
-static void print_mat(ostream& out, Mat& m) {
+// Print the given Mat to the given output stream
+static void print_mat(ostream& out, const Mat& m) {
   for(int i = 0; i < m.rows; i++) {
     for(int j = 0; j < m.cols; j++) {
       out << m.at<double>(i,j) << ' ';
@@ -174,6 +190,7 @@ static void print_mat(ostream& out, Mat& m) {
   } 
 }
 
+// Read data into the given Mat from the given input stream
 static void read_mat(istream& in, Mat& m) {
   for(int i = 0; i < m.rows; i++) {
     for(int j = 0; j < m.cols; j++) {
@@ -182,7 +199,8 @@ static void read_mat(istream& in, Mat& m) {
   } 
 }
 
-static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* path) {
+// Save calibration params
+static void calib_save_params(const Mat& camera_matrix, const Mat& dist_coeffs, const char* path) {
   ofstream out(path);
   
   print_mat(out, camera_matrix);
@@ -191,6 +209,7 @@ static void calib_save_params(Mat camera_matrix, Mat dist_coeffs, const char* pa
   out.close();
 }
 
+// Load parameters for undistortion algorithm
 static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const char* path) { 
   ifstream in(path);
 
@@ -200,7 +219,18 @@ static void undistort_load_params(Mat& camera_matrix, Mat& dist_coeffs, const ch
   in.close();
 }
 
-static int open_stream(const char* path, int width, int height, int frame_bytes) { 
+/* Open a v4l2loopback video device for streaming data
+ * path        = path to device
+ * width       = width of the image
+ * height      = height of the image
+ * frame_bytes = number of bytes in a frame
+ *
+ * returns a handle to the video device
+ *
+ * Code inspired from the official v4l2loopback examples on github
+ * https://github.com/umlaeute/v4l2loopback
+ */
+static int v4l2_open_stream(const char* path, const int width, const int height, const int frame_bytes) { 
   int stream = open(path, O_RDWR);
   if(stream == -1) {
     cerr << "Could not open output stream!" << endl;
@@ -230,8 +260,9 @@ static int open_stream(const char* path, int width, int height, int frame_bytes)
   return stream;
 }
 
-static void print_mat_to_stream(int stream, Mat& img, int frame_bytes) {
+// Print frame_bytes bytes from the given Mat to the given v4l2loopback device
+static void print_mat_to_stream(const int device, const Mat& img, const int frame_bytes) {
   Mat yuv;
   cvtColor(img, yuv, COLOR_BGR2YUV_I420);
-  write(stream, yuv.ptr(), frame_bytes);
+  write(device, yuv.ptr(), frame_bytes);
 }
